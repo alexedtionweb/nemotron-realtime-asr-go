@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nemotron ASR — live transcription</title>
+<style>
+  body { max-width: 720px; margin: 3rem auto; padding: 0 1rem; font: 16px system-ui, sans-serif; }
+  button, select { font: inherit; padding: .5rem .7rem; }
+  #status { color: #666; margin: 1rem 0; }
+  #transcript { white-space: pre-wrap; min-height: 5rem; padding: 1rem; background: #f4f4f5; border-radius: .5rem; }
+</style>
+<h1>Live transcription</h1>
+<label>Language <select id="language"><option value="auto" selected>Loading languages…</option></select></label>
+<button id="start">Start microphone</button>
+<button id="stop" disabled>Stop</button>
+<div id="status">Idle</div>
+<div id="transcript" aria-live="polite"></div>
+<script>
+const start = document.querySelector('#start'), stop = document.querySelector('#stop');
+const status = document.querySelector('#status'), transcript = document.querySelector('#transcript');
+let socket, context, source, processor, stream, resampler;
+
+function setStatus(text) { status.textContent = text; }
+
+// Request 16 kHz from Web Audio so the browser's native, high-quality sample
+// rate converter is used. This fallback preserves fractional resampling state
+// across callbacks; independent per-callback resampling drifts over time and
+// hurts word accuracy.
+class StreamingResampler {
+  constructor(inputRate, outputRate) { this.step = inputRate / outputRate; this.position = 0; this.tail = new Float32Array(); }
+  process(input) {
+    const source = new Float32Array(this.tail.length + input.length);
+    source.set(this.tail); source.set(input, this.tail.length);
+    const output = [];
+    while (this.position + 1 < source.length) {
+      const left = Math.floor(this.position), fraction = this.position - left;
+      output.push(source[left] + (source[left + 1] - source[left]) * fraction);
+      this.position += this.step;
+    }
+    const consumed = Math.floor(this.position);
+    this.tail = source.slice(consumed);
+    this.position -= consumed;
+    return Float32Array.from(output);
+  }
+}
+
+function pcm16(samples) {
+  const buffer = new ArrayBuffer(samples.length * 2), view = new DataView(buffer);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(i * 2, s < 0 ? s * 32768 : s * 32767, true);
+  }
+  return buffer;
+}
+
+start.onclick = async () => {
+  try {
+    transcript.textContent = '';
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/transcribe`);
+    socket.binaryType = 'arraybuffer';
+    socket.onmessage = ({data}) => {
+      const message = JSON.parse(data);
+      if (message.type === 'ready') setStatus('Listening…');
+      if (message.type === 'partial' || message.type === 'final') transcript.textContent = message.text || '';
+      if (message.type === 'error') setStatus(`Error: ${message.error}`);
+    };
+    socket.onclose = () => setStatus('Disconnected');
+    await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
+    socket.send(JSON.stringify({type: 'start', language: document.querySelector('#language').value}));
+
+    context = new AudioContext({sampleRate: 16000, latencyHint: 'interactive'});
+    resampler = context.sampleRate === 16000 ? null : new StreamingResampler(context.sampleRate, 16000);
+    source = context.createMediaStreamSource(stream);
+    processor = context.createScriptProcessor(2048, 1, 1);
+    processor.onaudioprocess = event => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      const input = event.inputBuffer.getChannelData(0);
+      socket.send(pcm16(resampler ? resampler.process(input) : input));
+    };
+    source.connect(processor); processor.connect(context.destination);
+    start.disabled = true; stop.disabled = false;
+  } catch (error) { setStatus(`Microphone error: ${error.message}`); }
+};
+
+fetch('/languages').then(response => response.json()).then(languages => {
+  const select = document.querySelector('#language');
+  select.replaceChildren(...languages.map(code => {
+    const option = document.createElement('option'); option.value = code;
+    option.textContent = code === 'auto' ? 'Auto-detect language' : code;
+    return option;
+  }));
+}).catch(() => setStatus('Could not load language list; auto-detect remains selected.'));
+
+stop.onclick = () => {
+  processor?.disconnect(); source?.disconnect(); context?.close(); stream?.getTracks().forEach(track => track.stop());
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type: 'end'}));
+  start.disabled = false; stop.disabled = true; setStatus('Finishing…');
+};
+</script>
