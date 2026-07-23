@@ -56,6 +56,16 @@ type Config struct {
 	Debug                 bool
 }
 
+// Token is a single emitted subword unit, tagged with the approximate
+// wall-clock offset (in seconds, from the start of the session) of the
+// encoder frame that produced it. Word boundaries are marked by the
+// SentencePiece "▁" prefix convention, same as tokenizer.Detokenize.
+type Token struct {
+	ID      int32
+	Piece   string
+	TimeSec float64
+}
+
 type Model struct {
 	cfg Config
 	tok *tokenizer.Tokenizer
@@ -66,6 +76,7 @@ type Model struct {
 
 	newChunkSamples int
 	tailSamples     int
+	hopSamples      int
 
 	// Persistent encoder cache
 	cacheLastChannel    []float32
@@ -78,6 +89,10 @@ type Model struct {
 	decState2   []float32
 	lastToken   int32
 	allTokenIDs []int32
+
+	// Running count of encoded (post-subsampling) frames actually decoded
+	// so far this session, used to derive absolute token timestamps.
+	encFrameCounter int64
 
 	// Reusable scratch buffers to guarantee zero heap allocations in hot loop
 	combinedAudio []float32
@@ -172,6 +187,7 @@ func (m *Model) computeFraming() {
 	m.newChunkSamples = m.cfg.ChunkSizeOutputFrames * m.cfg.SubsamplingFactor * hop
 	m.tailSamples = max(0, totalSamples-m.newChunkSamples)
 	m.audioTail = make([]float32, m.tailSamples)
+	m.hopSamples = hop
 }
 
 func (m *Model) ChunkSamples() int { return m.newChunkSamples }
@@ -187,6 +203,7 @@ func (m *Model) Reset() {
 	m.cacheLastChannelLen = 0
 	m.lastToken = int32(m.cfg.BlankID)
 	m.allTokenIDs = m.allTokenIDs[:0]
+	m.encFrameCounter = 0
 }
 
 func (m *Model) SetPromptIndex(promptIndex int64) {
@@ -198,7 +215,7 @@ func (m *Model) Transcript() string {
 	return m.tok.Detokenize(int32sToInts(m.allTokenIDs))
 }
 
-func (m *Model) FeedChunk(newSamples []float32) ([]int32, error) {
+func (m *Model) FeedChunk(newSamples []float32) ([]Token, error) {
 	if len(newSamples) != m.newChunkSamples {
 		return nil, fmt.Errorf("FeedChunk expects exactly %d samples, got %d", m.newChunkSamples, len(newSamples))
 	}
@@ -240,10 +257,18 @@ func (m *Model) FeedChunk(newSamples []float32) ([]int32, error) {
 		log.Printf("[asr] mel features: shape=[1,%d,%d] min=%.4f max=%.4f mean=%.4f rms=%.4f", m.cfg.NMels, T, mn, mx, mean, rms)
 	}
 
-	encodedIDs, err := m.runEncoderStep(m.flatMel, T, 0)
+	// IMPORTANT: the first DropExtraPreEncoded output frames only exist to
+	// give the encoder's conv/attention stack enough left-context (they were
+	// computed from m.audioTail, i.e. audio that was already encoded and
+	// decoded as part of the *previous* chunk). They must be dropped here —
+	// decoding them re-feeds already-transcribed audio into the RNN-T and
+	// produces duplicated/garbled words at every chunk boundary.
+	encodedFrames, err := m.runEncoderStep(m.flatMel, T, m.cfg.DropExtraPreEncoded)
 	if err != nil {
 		return nil, err
 	}
+	baseFrame := m.encFrameCounter
+	m.encFrameCounter += int64(len(encodedFrames))
 
 	// Carry audio tail forward
 	if m.tailSamples > 0 {
@@ -251,15 +276,20 @@ func (m *Model) FeedChunk(newSamples []float32) ([]int32, error) {
 		copy(m.audioTail, newSamples[start:])
 	}
 
-	var emitted []int32
-	for _, encFrame := range encodedIDs {
-		ids, err := m.greedyDecodeFrame(encFrame)
+	frameStepSec := float64(m.cfg.SubsamplingFactor*m.hopSamples) / float64(m.cfg.SampleRate)
+
+	var emitted []Token
+	for i, encFrame := range encodedFrames {
+		frameTime := float64(baseFrame+int64(i)) * frameStepSec
+		toks, err := m.greedyDecodeFrame(encFrame, frameTime)
 		if err != nil {
 			return nil, err
 		}
-		emitted = append(emitted, ids...)
+		emitted = append(emitted, toks...)
 	}
-	m.allTokenIDs = append(m.allTokenIDs, emitted...)
+	for _, t := range emitted {
+		m.allTokenIDs = append(m.allTokenIDs, t.ID)
+	}
 	return emitted, nil
 }
 
@@ -351,6 +381,10 @@ func (m *Model) runEncoderStep(melFlat []float32, T int, drop int) ([][]float32,
 	drop = min(drop, encT)
 	kept := encT - drop
 
+	if m.cfg.Debug {
+		log.Printf("[asr] dropping %d pre-encoded context frame(s), keeping %d/%d", drop, kept, encT)
+	}
+
 	// Allocate frames in a single contiguous block for cache locality
 	backing := make([]float32, kept*hidden)
 	frames := make([][]float32, kept)
@@ -367,10 +401,12 @@ func (m *Model) runEncoderStep(melFlat []float32, T int, drop int) ([][]float32,
 }
 
 // greedyDecodeFrame runs the RNN-T label loop for a single encoder frame.
-// Zero-allocation path for state & tensor inputs.
-func (m *Model) greedyDecodeFrame(encFrame []float32) ([]int32, error) {
+// Zero-allocation path for state & tensor inputs. frameTime is the
+// approximate session-relative time (seconds) this encoder frame covers,
+// stamped onto every token emitted from it.
+func (m *Model) greedyDecodeFrame(encFrame []float32, frameTime float64) ([]Token, error) {
 	const maxSymbolsPerStep = 10
-	var emitted []int32
+	var emitted []Token
 
 	for step := range maxSymbolsPerStep {
 		// Create tensors directly over persistent memory slices (no append copies)
@@ -479,7 +515,11 @@ func (m *Model) greedyDecodeFrame(encFrame []float32) ([]int32, error) {
 			break
 		}
 
-		emitted = append(emitted, int32(best))
+		emitted = append(emitted, Token{
+			ID:      int32(best),
+			Piece:   m.tok.IDToPiece(best),
+			TimeSec: frameTime,
+		})
 		m.lastToken = int32(best)
 	}
 

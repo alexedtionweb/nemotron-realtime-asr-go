@@ -25,10 +25,16 @@ type clientMessage struct {
 	Language string `json:"language"`
 }
 
-type transcriptMessage struct {
-	Type  string `json:"type"`
-	Text  string `json:"text,omitempty"`
-	Error string `json:"error,omitempty"`
+// wsEnvelope is the message shape sent to the browser. It mirrors the
+// nemotron.Result the SDK returns, plus protocol-level "ready"/"error"
+// types the SDK itself doesn't know about.
+type wsEnvelope struct {
+	Type        string          `json:"type"` // "ready" | "partial" | "final" | "error"
+	Transcript  string          `json:"transcript,omitempty"`
+	NewWords    []nemotron.Word `json:"new_words,omitempty"`
+	IsFinal     bool            `json:"is_final,omitempty"`
+	Diarization any             `json:"diarization,omitempty"`
+	Error       string          `json:"error,omitempty"`
 }
 
 func main() {
@@ -96,7 +102,7 @@ func handleTranscription(conn *websocket.Conn, engine *nemotron.Engine) {
 		case websocket.TextMessage:
 			var msg clientMessage
 			if err := json.Unmarshal(payload, &msg); err != nil {
-				writeMessage(conn, transcriptMessage{Type: "error", Error: "invalid control message"})
+				writeMessage(conn, wsEnvelope{Type: "error", Error: "invalid control message"})
 				continue
 			}
 
@@ -113,19 +119,29 @@ func handleTranscription(conn *websocket.Conn, engine *nemotron.Engine) {
 
 				session, err = engine.NewSession(language)
 				if err != nil {
-					writeMessage(conn, transcriptMessage{Type: "error", Error: err.Error()})
+					writeMessage(conn, wsEnvelope{Type: "error", Error: err.Error()})
 					session = nil
 					continue
 				}
-				writeMessage(conn, transcriptMessage{Type: "ready"})
+				// The client must wait for this before it starts sending
+				// audio — a session isn't ready to accept binary frames
+				// until here. Sending audio before this arrives means it
+				// gets rejected below and is lost, which is why the client
+				// now blocks its mic capture on this message.
+				writeMessage(conn, wsEnvelope{Type: "ready"})
 
 			case "end":
 				if session != nil {
-					finalText, err := session.Finalize()
+					result, err := session.Finalize()
 					if err != nil {
-						writeMessage(conn, transcriptMessage{Type: "error", Error: err.Error()})
+						writeMessage(conn, wsEnvelope{Type: "error", Error: err.Error()})
+					} else {
+						writeMessage(conn, wsEnvelope{
+							Type: result.Type, Transcript: result.Transcript,
+							NewWords: result.NewWords, IsFinal: result.IsFinal,
+							Diarization: result.Diarization,
+						})
 					}
-					writeMessage(conn, transcriptMessage{Type: "final", Text: finalText})
 					session.Close()
 					session = nil
 				}
@@ -133,23 +149,27 @@ func handleTranscription(conn *websocket.Conn, engine *nemotron.Engine) {
 
 		case websocket.BinaryMessage:
 			if session == nil {
-				writeMessage(conn, transcriptMessage{Type: "error", Error: "send a start message before audio"})
+				writeMessage(conn, wsEnvelope{Type: "error", Error: "send a start message before audio"})
 				continue
 			}
 
 			// The SDK handles all float conversion, buffering, and chunk sizes internally.
-			text, err := session.WritePCM16(payload)
+			result, err := session.WritePCM16(payload)
 			if err != nil {
-				writeMessage(conn, transcriptMessage{Type: "error", Error: err.Error()})
+				writeMessage(conn, wsEnvelope{Type: "error", Error: err.Error()})
 				continue
 			}
 
-			writeMessage(conn, transcriptMessage{Type: "partial", Text: text})
+			writeMessage(conn, wsEnvelope{
+				Type: result.Type, Transcript: result.Transcript,
+				NewWords: result.NewWords, IsFinal: result.IsFinal,
+				Diarization: result.Diarization,
+			})
 		}
 	}
 }
 
-func writeMessage(conn *websocket.Conn, message transcriptMessage) {
+func writeMessage(conn *websocket.Conn, message wsEnvelope) {
 	b, _ := json.Marshal(message)
 	if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
 		log.Printf("write WebSocket message: %v", err)

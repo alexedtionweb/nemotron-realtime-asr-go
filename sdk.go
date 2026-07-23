@@ -26,11 +26,54 @@ type Engine struct {
 	idle     []*asr.Model
 }
 
+// Word is a single finalized word with session-relative timestamps, in the
+// same spirit as the "words" array returned by Deepgram/Google STT/OpenAI's
+// realtime transcription APIs.
+type Word struct {
+	Text  string  `json:"word"`
+	Start float64 `json:"start_sec"`
+	End   float64 `json:"end_sec"`
+}
+
+// Result is returned from every WritePCM16/Finalize call. It mirrors the
+// shape used by industry streaming STT APIs: a running transcript, the
+// words that became final during this call, and an is_final flag for
+// utterance boundaries.
+//
+// Because Nemotron's cache-aware streaming encoder never revises tokens it
+// has already emitted (unlike re-decoding approaches), every word in
+// NewWords is genuinely final the moment it's returned — it will not change
+// on subsequent calls. IsFinal instead marks the *session* boundary (set
+// only by Finalize), since this SDK has no VAD/endpointing model to detect
+// mid-stream utterance breaks on its own.
+type Result struct {
+	Type       string `json:"type"` // "partial" | "final"
+	Transcript string `json:"transcript"`
+	NewWords   []Word `json:"new_words,omitempty"`
+	IsFinal    bool   `json:"is_final"`
+
+	// Diarization is always nil. Nemotron 3.5 Streaming is a
+	// transcription-only RNN-T model — it has no speaker-embedding or
+	// clustering head, so it cannot produce speaker labels. Real
+	// diarization needs a separate model (e.g. NeMo's Sortformer / speaker
+	// diarization pipeline) run alongside this one, with its speaker turns
+	// aligned against Word.Start/Word.End. This field is kept in the schema
+	// so clients written against Deepgram/Google-style payloads don't have
+	// to special-case this API, but it's never populated here.
+	Diarization any `json:"diarization"`
+}
+
 // Session represents a single active audio stream being transcribed.
 type Session struct {
 	engine  *Engine
 	model   *asr.Model
 	pending []float32
+
+	words         []Word
+	openWord      strings.Builder
+	openStart     float64
+	openActive    bool
+	lastTokenTime float64
 }
 
 type modelConfig struct {
@@ -183,11 +226,53 @@ func (e *Engine) NewSession(language string) (*Session, error) {
 	return &Session{engine: e, model: m}, nil
 }
 
-// WritePCM16 accepts raw little-endian PCM16 bytes, buffers them, runs inference
-// if enough frames are collected, and returns the current partial transcript.
-func (s *Session) WritePCM16(data []byte) (string, error) {
+// ingestTokens folds newly-decoded subword tokens into whole words, using
+// the SentencePiece "▁" prefix to detect word starts. It returns the words
+// that became final (closed) during this call and updates session state for
+// the word still being built, if any.
+func (s *Session) ingestTokens(tokens []asr.Token) []Word {
+	var closed []Word
+	for _, t := range tokens {
+		isWordStart := strings.HasPrefix(t.Piece, "\u2581")
+		piece := strings.TrimPrefix(t.Piece, "\u2581")
+
+		if isWordStart {
+			if w, ok := s.flushOpenWord(); ok {
+				closed = append(closed, w)
+			}
+			s.openStart = t.TimeSec
+			s.openActive = true
+		} else if !s.openActive {
+			s.openStart = t.TimeSec
+			s.openActive = true
+		}
+
+		s.openWord.WriteString(piece)
+		s.lastTokenTime = t.TimeSec
+	}
+	return closed
+}
+
+func (s *Session) flushOpenWord() (Word, bool) {
+	if !s.openActive || s.openWord.Len() == 0 {
+		s.openWord.Reset()
+		s.openActive = false
+		return Word{}, false
+	}
+	w := Word{Text: s.openWord.String(), Start: s.openStart, End: s.lastTokenTime}
+	s.words = append(s.words, w)
+	s.openWord.Reset()
+	s.openActive = false
+	return w, true
+}
+
+// WritePCM16 accepts raw little-endian PCM16 bytes, buffers them, runs
+// inference on every full chunk that has accumulated, and returns a
+// structured partial result: the running transcript plus any words that
+// became final during this call.
+func (s *Session) WritePCM16(data []byte) (*Result, error) {
 	if len(data)%2 != 0 {
-		return "", fmt.Errorf("audio must be PCM16 little-endian (even length)")
+		return nil, fmt.Errorf("audio must be PCM16 little-endian (even length)")
 	}
 
 	// Convert bytes to float32 and append to session buffer
@@ -197,30 +282,51 @@ func (s *Session) WritePCM16(data []byte) (string, error) {
 	}
 
 	chunkSize := s.model.ChunkSamples()
-	var err error
+	var newWords []Word
 
 	for len(s.pending) >= chunkSize {
-		_, err = s.model.FeedChunk(s.pending[:chunkSize])
+		tokens, err := s.model.FeedChunk(s.pending[:chunkSize])
 		if err != nil {
-			return "", err
+			return nil, err
 		}
+		newWords = append(newWords, s.ingestTokens(tokens)...)
 		s.pending = s.pending[chunkSize:]
 	}
 
-	return s.model.Transcript(), nil
+	return &Result{
+		Type:       "partial",
+		Transcript: s.model.Transcript(),
+		NewWords:   newWords,
+		IsFinal:    false,
+	}, nil
 }
 
-// Finalize processes any remaining trailing audio and returns the final text.
-func (s *Session) Finalize() (string, error) {
+// Finalize processes any remaining trailing audio, closes out whatever word
+// was still being built, and returns the final result for the session.
+func (s *Session) Finalize() (*Result, error) {
+	var newWords []Word
+
 	if len(s.pending) > 0 {
 		chunk := make([]float32, s.model.ChunkSamples())
 		copy(chunk, s.pending)
-		if _, err := s.model.FeedChunk(chunk); err != nil {
-			return "", err
+		tokens, err := s.model.FeedChunk(chunk)
+		if err != nil {
+			return nil, err
 		}
-		s.pending = s.pending[:0] // Clear buffer
+		newWords = append(newWords, s.ingestTokens(tokens)...)
+		s.pending = s.pending[:0]
 	}
-	return s.model.Transcript(), nil
+
+	if w, ok := s.flushOpenWord(); ok {
+		newWords = append(newWords, w)
+	}
+
+	return &Result{
+		Type:       "final",
+		Transcript: s.model.Transcript(),
+		NewWords:   newWords,
+		IsFinal:    true,
+	}, nil
 }
 
 // Close resets the model state and returns it to the engine pool.
