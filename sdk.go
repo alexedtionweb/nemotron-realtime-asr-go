@@ -24,6 +24,17 @@ type Engine struct {
 	cfg      modelConfig
 	mu       sync.Mutex
 	idle     []*asr.Model
+	debug    bool
+}
+
+// SetDebug enables or disables debug logging for future sessions.
+func (e *Engine) SetDebug(enabled bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.debug = enabled
+	for _, m := range e.idle {
+		m.SetDebug(enabled)
+	}
 }
 
 // Word is a single finalized word with session-relative timestamps, in the
@@ -279,7 +290,7 @@ func (e *Engine) NewSession(language string) (*Session, error) {
 			ChunkSizeOutputFrames: e.cfg.ChunkSizeOutputFrames, DropExtraPreEncoded: e.cfg.DropExtraPreEncoded,
 			NumEncoderLayers: e.cfg.NumEncoderLayers, HiddenDim: e.cfg.HiddenDim, CacheLeftContext: cacheLeft,
 			ConvContext: e.cfg.ConvContext, VocabSize: e.cfg.VocabSize, BlankID: e.cfg.BlankID,
-			DecoderStateDim: 640, DecoderNumLayers: 2, PromptIndex: prompt,
+			DecoderStateDim: 640, DecoderNumLayers: 2, PromptIndex: prompt, Debug: e.debug,
 		})
 	if err != nil {
 		return nil, err

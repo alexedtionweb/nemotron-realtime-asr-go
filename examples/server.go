@@ -41,6 +41,7 @@ func main() {
 	modelDir := flag.String("model-dir", "/path/to/nemotron/model", "Path to the downloaded ONNX model directory")
 	ortLib := flag.String("ort-lib", "/usr/local/lib/libonnxruntime.so", "Path to the ONNX Runtime shared library")
 	listenAddr := flag.String("addr", ":8081", "HTTP server address to listen on")
+	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
 	// 1. Initialize the ASR Engine using the SDK
@@ -49,6 +50,9 @@ func main() {
 		log.Fatalf("Failed to initialize Nemotron engine: %v", err)
 	}
 	defer engine.Close()
+	if *debug {
+		engine.SetDebug(true)
+	}
 
 	// 2. Setup standard HTTP Routes
 	mux := http.NewServeMux()

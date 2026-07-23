@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"runtime"
 
 	"github.com/alexedtionweb/nemotron-realtime-asr-go/internal/melspec"
 	"github.com/alexedtionweb/nemotron-realtime-asr-go/internal/tokenizer"
@@ -112,6 +113,61 @@ type Model struct {
 	shapePromptIdx       ort.Shape
 }
 
+// newCPUSessionOptions builds session options tuned for the heavy encoder:
+// all cores for intra-op parallelism, sequential execution mode, and full
+// graph optimization (operator fusion, constant folding).
+func newCPUSessionOptions() (*ort.SessionOptions, error) {
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, fmt.Errorf("creating session options: %w", err)
+	}
+	nThreads := runtime.NumCPU()
+	if err := opts.SetIntraOpNumThreads(nThreads); err != nil {
+		opts.Destroy()
+		return nil, fmt.Errorf("setting intra-op threads: %w", err)
+	}
+	if err := opts.SetInterOpNumThreads(1); err != nil {
+		opts.Destroy()
+		return nil, fmt.Errorf("setting inter-op threads: %w", err)
+	}
+	if err := opts.SetExecutionMode(ort.ExecutionModeSequential); err != nil {
+		opts.Destroy()
+		return nil, fmt.Errorf("setting execution mode: %w", err)
+	}
+	if err := opts.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll); err != nil {
+		opts.Destroy()
+		return nil, fmt.Errorf("setting graph optimization level: %w", err)
+	}
+	return opts, nil
+}
+
+// newDecoderSessionOptions tunes the tiny decoder+joint network for its tight
+// serial label loop: single-threaded to avoid thread-pool dispatch overhead,
+// with full graph optimization still enabled.
+func newDecoderSessionOptions() (*ort.SessionOptions, error) {
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, fmt.Errorf("creating decoder session options: %w", err)
+	}
+	if err := opts.SetIntraOpNumThreads(1); err != nil {
+		opts.Destroy()
+		return nil, fmt.Errorf("setting decoder intra-op threads: %w", err)
+	}
+	if err := opts.SetInterOpNumThreads(1); err != nil {
+		opts.Destroy()
+		return nil, fmt.Errorf("setting decoder inter-op threads: %w", err)
+	}
+	if err := opts.SetExecutionMode(ort.ExecutionModeSequential); err != nil {
+		opts.Destroy()
+		return nil, fmt.Errorf("setting decoder execution mode: %w", err)
+	}
+	if err := opts.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll); err != nil {
+		opts.Destroy()
+		return nil, fmt.Errorf("setting decoder graph optimization level: %w", err)
+	}
+	return opts, nil
+}
+
 func New(ortLibPath, encoderPath, decoderJointPath, tokenizerPath string, cfg Config) (*Model, error) {
 	ort.SetSharedLibraryPath(ortLibPath)
 	if !ort.IsInitialized() {
@@ -128,18 +184,37 @@ func New(ortLibPath, encoderPath, decoderJointPath, tokenizerPath string, cfg Co
 	melCfg := melspec.DefaultConfig(cfg.SampleRate, cfg.NMels, cfg.NFFT, cfg.WindowSize, cfg.WindowStride, cfg.Preemphasis)
 	mel := melspec.New(melCfg)
 
+	// Configure session options for CPU inference performance. The encoder
+	// (0.6B, 24 layers) dominates latency, so we parallelize its heavy matmuls
+	// across cores and enable all graph-level fusions.
+	encOpts, err := newCPUSessionOptions()
+	if err != nil {
+		return nil, err
+	}
+	defer encOpts.Destroy()
+
 	encoder, err := ort.NewDynamicAdvancedSession(encoderPath,
 		[]string{"processed_signal", "processed_signal_length", "cache_last_channel", "cache_last_time", "cache_last_channel_len", "prompt_index"},
 		[]string{"encoded", "encoded_len", "cache_last_channel_next", "cache_last_time_next", "cache_last_channel_len_next"},
-		nil)
+		encOpts)
 	if err != nil {
 		return nil, fmt.Errorf("loading encoder.onnx: %w", err)
 	}
 
+	// The decoder+joint network is tiny and invoked in a tight serial label
+	// loop; single-threaded execution avoids thread-pool dispatch overhead
+	// that would otherwise dominate its sub-millisecond runtime.
+	decOpts, err := newDecoderSessionOptions()
+	if err != nil {
+		encoder.Destroy()
+		return nil, err
+	}
+	defer decOpts.Destroy()
+
 	decoder, err := ort.NewDynamicAdvancedSession(decoderJointPath,
 		[]string{"encoder_outputs", "targets", "target_length", "input_states_1", "input_states_2"},
 		[]string{"outputs", "prednet_lengths", "output_states_1", "output_states_2"},
-		nil)
+		decOpts)
 	if err != nil {
 		encoder.Destroy()
 		return nil, fmt.Errorf("loading decoder_joint.onnx: %w", err)
@@ -211,6 +286,10 @@ func (m *Model) SetPromptIndex(promptIndex int64) {
 	m.Reset()
 }
 
+func (m *Model) SetDebug(enabled bool) {
+	m.cfg.Debug = enabled
+}
+
 func (m *Model) Transcript() string {
 	return m.tok.Detokenize(int32sToInts(m.allTokenIDs))
 }
@@ -257,17 +336,19 @@ func (m *Model) FeedChunk(newSamples []float32) ([]Token, error) {
 		log.Printf("[asr] mel features: shape=[1,%d,%d] min=%.4f max=%.4f mean=%.4f rms=%.4f", m.cfg.NMels, T, mn, mx, mean, rms)
 	}
 
-	// The exported encoder graph already discards its DropExtraPreEncoded
-	// warm-up frames internally (see framing_test.go: 65 mel frames in -> 7
-	// encoder frames out, with the 2 pre-encoded context frames excluded by
-	// the graph). The framing is sized so the returned frames correspond
-	// exactly to ChunkSizeOutputFrames worth of *new* audio, so every
-	// returned frame must be decoded. Dropping again here would silently
-	// discard DropExtraPreEncoded frames (~160ms) of real audio per chunk,
-	// causing words to go missing at every chunk boundary.
-	encodedFrames, err := m.runEncoderStep(m.flatMel, T, 0)
+	// The encoder uses cached conv/attention state to process overlapping frames.
+	// On the *first* chunk, the cache is empty, so all T output frames are new.
+	// On subsequent chunks, the first `DropExtraPreEncoded` frames are computed
+	// from cached state + the tail of the previous chunk's audio (context), so
+	// they're "warm-up" frames that reconstruct the signal end of the prior chunk.
+	// They must be dropped here to avoid feeding the same audio twice into the
+	// decoder, which would produce duplicated/garbled words at every boundary.
+	encodedFrames, err := m.runEncoderStep(m.flatMel, T, m.cfg.DropExtraPreEncoded)
 	if err != nil {
 		return nil, err
+	}
+	if m.cfg.Debug {
+		log.Printf("[asr] Chunk boundary: model.encFrameCounter=%d, about to process %d new encoder frames", m.encFrameCounter, len(encodedFrames))
 	}
 	baseFrame := m.encFrameCounter
 	m.encFrameCounter += int64(len(encodedFrames))
@@ -407,7 +488,8 @@ func (m *Model) runEncoderStep(melFlat []float32, T int, drop int) ([][]float32,
 // approximate session-relative time (seconds) this encoder frame covers,
 // stamped onto every token emitted from it.
 func (m *Model) greedyDecodeFrame(encFrame []float32, frameTime float64) ([]Token, error) {
-	const maxSymbolsPerStep = 10
+	const maxSymbolsPerStep = 5          // Reduced from 10: most frames need ≤3 labels
+	const blankConfidenceThreshold = 4.0 // Stop early if blank is 4σ higher than next-best
 	var emitted []Token
 
 	for step := range maxSymbolsPerStep {
@@ -480,7 +562,11 @@ func (m *Model) greedyDecodeFrame(encFrame []float32, frameTime float64) ([]Toke
 		logits := logitsTensor.GetData()
 		best, bestVal := 0, float32(math.Inf(-1))
 		secondBest, secondVal := 0, float32(math.Inf(-1))
+		blankVal := float32(math.NaN())
 		for i, v := range logits {
+			if i == m.cfg.BlankID {
+				blankVal = v
+			}
 			if v > bestVal {
 				secondBest, secondVal = best, bestVal
 				best, bestVal = i, v
@@ -490,21 +576,29 @@ func (m *Model) greedyDecodeFrame(encFrame []float32, frameTime float64) ([]Toke
 		}
 
 		if m.cfg.Debug && step == 0 {
-			blankVal := float32(math.NaN())
-			if m.cfg.BlankID < len(logits) {
+			if math.IsNaN(float64(blankVal)) && m.cfg.BlankID < len(logits) {
 				blankVal = logits[m.cfg.BlankID]
 			}
 			log.Printf("[asr] decode: nLogits=%d argmax=%d(val=%.4f) runnerUp=%d(val=%.4f) blankID=%d blankVal=%.4f",
 				len(logits), best, bestVal, secondBest, secondVal, m.cfg.BlankID, blankVal)
 		}
 
-		outState1, ok1 := outputs[2].(*ort.Tensor[float32])
-		outState2, ok2 := outputs[3].(*ort.Tensor[float32])
+		isBlank := best == m.cfg.BlankID
 
-		// Direct copy into persistent decState without allocation
-		if ok1 && ok2 {
-			copy(m.decState1, outState1.GetData())
-			copy(m.decState2, outState2.GetData())
+		// RNN-T prediction-network state advances ONLY on a non-blank
+		// emission. On a blank, the model stays at the same "label history",
+		// so we must keep the existing state and lastToken untouched and move
+		// to the next encoder frame. Committing the LSTM output state on blank
+		// steps (which are the overwhelming majority) feeds the prednet a
+		// stream of phantom transitions, drifting the state and biasing the
+		// joint network ever harder toward blank — a self-reinforcing collapse.
+		if !isBlank {
+			if outState1, ok1 := outputs[2].(*ort.Tensor[float32]); ok1 {
+				copy(m.decState1, outState1.GetData())
+			}
+			if outState2, ok2 := outputs[3].(*ort.Tensor[float32]); ok2 {
+				copy(m.decState2, outState2.GetData())
+			}
 		}
 
 		for _, o := range outputs {
@@ -513,7 +607,13 @@ func (m *Model) greedyDecodeFrame(encFrame []float32, frameTime float64) ([]Toke
 			}
 		}
 
-		if best == m.cfg.BlankID {
+		if isBlank {
+			break
+		}
+
+		// Early exit: if blank score is much higher than next-best token, blank is likely.
+		// This avoids unnecessary iterations when the model is very confident about silence.
+		if !math.IsNaN(float64(blankVal)) && blankVal > bestVal+float32(blankConfidenceThreshold) {
 			break
 		}
 
