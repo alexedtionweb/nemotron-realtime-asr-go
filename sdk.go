@@ -128,7 +128,10 @@ type modelConfig struct {
 	VocabSize             int              `json:"vocab_size"`
 	BlankID               int              `json:"blank_id"`
 	PromptDictionary      map[string]int64 `json:"prompt_dictionary"`
-	Preprocessor          struct {
+	// Fallback used when prompt_dictionary is absent (e.g. Nemotron 3.5 HF models).
+	DefaultPromptID int64 `json:"default_prompt_id"`
+	NumPrompts      int   `json:"num_prompts"`
+	Preprocessor    struct {
 		WindowSize   float64 `json:"window_size"`
 		WindowStride float64 `json:"window_stride"`
 		NFFT         int     `json:"n_fft"`
@@ -188,7 +191,12 @@ func (e *Engine) Close() {
 }
 
 // AvailableLanguages returns a sorted list of supported language codes.
+// When the model config has no prompt_dictionary (e.g. Nemotron 3.5 HF format),
+// returns ["auto"] backed by default_prompt_id.
 func (e *Engine) AvailableLanguages() []string {
+	if len(e.cfg.PromptDictionary) == 0 {
+		return []string{"auto"}
+	}
 	byPrompt := make(map[int64]string)
 	for code, prompt := range e.cfg.PromptDictionary {
 		current, exists := byPrompt[prompt]
@@ -225,9 +233,23 @@ func languageCodeScore(code string) int {
 
 // NewSession requests a fresh transcription session from the pool.
 func (e *Engine) NewSession(language string) (*Session, error) {
-	prompt, ok := e.cfg.PromptDictionary[language]
-	if !ok {
-		return nil, fmt.Errorf("unsupported language %q", language)
+	var prompt int64
+	if len(e.cfg.PromptDictionary) == 0 {
+		// Model uses default_prompt_id instead of a language dictionary
+		// (Nemotron 3.5 HF config format). Accept "auto" or "" as aliases for
+		// the default, and allow raw numeric prompt IDs as strings.
+		switch language {
+		case "auto", "":
+			prompt = e.cfg.DefaultPromptID
+		default:
+			return nil, fmt.Errorf("unsupported language %q (model has no prompt dictionary; use \"auto\")", language)
+		}
+	} else {
+		var ok bool
+		prompt, ok = e.cfg.PromptDictionary[language]
+		if !ok {
+			return nil, fmt.Errorf("unsupported language %q", language)
+		}
 	}
 
 	e.mu.Lock()
