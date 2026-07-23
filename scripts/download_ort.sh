@@ -9,7 +9,10 @@
 #   go run examples/server.go -ort-lib ./libs/libonnxruntime.so ...
 set -euo pipefail
 
-ORT_VERSION="1.21.0"
+# Must match the C API version required by yalue/onnxruntime_go (ORT_API_VERSION
+# in onnxruntime_c_api.h). v1.31.0 of that wrapper requires API version 26,
+# which is shipped by ORT 1.26.0.
+ORT_VERSION="1.26.0"
 INSTALL_DIR="${1:-/usr/local/lib}"
 
 # Detect platform
