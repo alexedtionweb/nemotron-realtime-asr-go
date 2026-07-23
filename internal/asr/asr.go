@@ -257,13 +257,15 @@ func (m *Model) FeedChunk(newSamples []float32) ([]Token, error) {
 		log.Printf("[asr] mel features: shape=[1,%d,%d] min=%.4f max=%.4f mean=%.4f rms=%.4f", m.cfg.NMels, T, mn, mx, mean, rms)
 	}
 
-	// IMPORTANT: the first DropExtraPreEncoded output frames only exist to
-	// give the encoder's conv/attention stack enough left-context (they were
-	// computed from m.audioTail, i.e. audio that was already encoded and
-	// decoded as part of the *previous* chunk). They must be dropped here —
-	// decoding them re-feeds already-transcribed audio into the RNN-T and
-	// produces duplicated/garbled words at every chunk boundary.
-	encodedFrames, err := m.runEncoderStep(m.flatMel, T, m.cfg.DropExtraPreEncoded)
+	// The exported encoder graph already discards its DropExtraPreEncoded
+	// warm-up frames internally (see framing_test.go: 65 mel frames in -> 7
+	// encoder frames out, with the 2 pre-encoded context frames excluded by
+	// the graph). The framing is sized so the returned frames correspond
+	// exactly to ChunkSizeOutputFrames worth of *new* audio, so every
+	// returned frame must be decoded. Dropping again here would silently
+	// discard DropExtraPreEncoded frames (~160ms) of real audio per chunk,
+	// causing words to go missing at every chunk boundary.
+	encodedFrames, err := m.runEncoderStep(m.flatMel, T, 0)
 	if err != nil {
 		return nil, err
 	}

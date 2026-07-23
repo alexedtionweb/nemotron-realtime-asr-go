@@ -69,11 +69,51 @@ type Session struct {
 	model   *asr.Model
 	pending []float32
 
+	// OnResult, if set, is invoked with the partial Result produced by every
+	// Write call (the io.Writer entry point). This mirrors the callback/event
+	// style used by mainstream streaming STT SDKs (Deepgram, AssemblyAI,
+	// Google) and lets callers pipe audio in with a standard io.Copy without
+	// juggling return values.
+	OnResult func(*Result)
+
+	oddByte    byte
+	hasOddByte bool
+
 	words         []Word
 	openWord      strings.Builder
 	openStart     float64
 	openActive    bool
 	lastTokenTime float64
+}
+
+// Write implements io.Writer over the raw little-endian PCM16 audio stream,
+// making a Session a drop-in sink for io.Copy, bufio, and the rest of the
+// standard streaming plumbing. Each call runs inference on any newly
+// completed chunks and, if OnResult is set, delivers the partial Result.
+// It always reports len(p) bytes consumed on success, since partial PCM16
+// frames are buffered internally until the next write.
+func (s *Session) Write(p []byte) (int, error) {
+	// Reassemble a 2-byte PCM16 sample that may have been split across
+	// writes (common with io.Copy's fixed-size buffers).
+	buf := p
+	if s.hasOddByte {
+		buf = append([]byte{s.oddByte}, p...)
+		s.hasOddByte = false
+	}
+	if len(buf)%2 != 0 {
+		s.oddByte = buf[len(buf)-1]
+		s.hasOddByte = true
+		buf = buf[:len(buf)-1]
+	}
+
+	res, err := s.WritePCM16(buf)
+	if err != nil {
+		return 0, err
+	}
+	if s.OnResult != nil {
+		s.OnResult(res)
+	}
+	return len(p), nil
 }
 
 type modelConfig struct {
@@ -284,13 +324,25 @@ func (s *Session) WritePCM16(data []byte) (*Result, error) {
 	chunkSize := s.model.ChunkSamples()
 	var newWords []Word
 
-	for len(s.pending) >= chunkSize {
-		tokens, err := s.model.FeedChunk(s.pending[:chunkSize])
+	// Consume full chunks via an index instead of reslicing s.pending
+	// forward. Reslicing (s.pending = s.pending[chunkSize:]) slides the
+	// slice header through an ever-growing backing array over the life of a
+	// long stream, so the array is never reclaimed — a per-session memory
+	// leak that adds up fast under many concurrent users.
+	consumed := 0
+	for len(s.pending)-consumed >= chunkSize {
+		tokens, err := s.model.FeedChunk(s.pending[consumed : consumed+chunkSize])
 		if err != nil {
 			return nil, err
 		}
 		newWords = append(newWords, s.ingestTokens(tokens)...)
-		s.pending = s.pending[chunkSize:]
+		consumed += chunkSize
+	}
+	if consumed > 0 {
+		// Move the residual (< chunkSize) samples back to the front of the
+		// same backing array and shrink the length, keeping capacity bounded.
+		n := copy(s.pending, s.pending[consumed:])
+		s.pending = s.pending[:n]
 	}
 
 	return &Result{
@@ -337,6 +389,7 @@ func (s *Session) Close() {
 	}
 	s.model.Reset()
 	s.pending = s.pending[:0]
+	s.hasOddByte = false
 
 	s.engine.mu.Lock()
 	defer s.engine.mu.Unlock()
