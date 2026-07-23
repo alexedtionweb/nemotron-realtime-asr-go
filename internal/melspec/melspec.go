@@ -1,8 +1,13 @@
+// Package melspec computes log-mel spectrogram features matching NVIDIA
+// NeMo's AudioToMelSpectrogramPreprocessor, driven by the model's own
+// config.json values (sample_rate, n_mels, window_size, window_stride,
+// n_fft, preemph). NeMo builds its mel filters via librosa.filters.mel(...)
+// with librosa's defaults, so this matches those specifically: the Slaney
+// mel scale (htk=False) with Slaney-style area-normalized filters
+// (norm='slaney'), a periodic Hann window, and a 2**-24 log-guard epsilon.
 package melspec
 
-import (
-	"math"
-)
+import "math"
 
 type Config struct {
 	SampleRate    int
@@ -14,6 +19,7 @@ type Config struct {
 	LogGuardValue float32
 }
 
+// DefaultConfig builds a Config from the model's config.json fields.
 func DefaultConfig(sampleRate, nMels, nFFT int, windowSize, windowStride, preemph float64) Config {
 	return Config{
 		SampleRate:    sampleRate,
@@ -26,56 +32,24 @@ func DefaultConfig(sampleRate, nMels, nFFT int, windowSize, windowStride, preemp
 	}
 }
 
-// melFilter represents a sparse mel filter row to avoid N^2 zero-multiplications
-type melFilter struct {
-	startBin int
-	weights  []float32
-}
-
 type Extractor struct {
-	cfg        Config
-	window     []float32
-	melFilters []melFilter
-	fftPlan    *fftPlan
+	cfg      Config
+	window   []float32   // Hann window, length WinLength
+	melBank  [][]float32 // [NMels][NFFT/2+1]
+	fftOrder int
 }
 
-// New builds an Extractor, precomputing the analysis window, sparse filters, and FFT plan.
-// Extractor is completely thread-safe for concurrent Compute() calls.
+// New builds an Extractor, precomputing the analysis window and mel filterbank.
 func New(cfg Config) *Extractor {
-	e := &Extractor{
-		cfg:     cfg,
-		window:  hannWindow(cfg.WinLength),
-		fftPlan: newFFTPlan(cfg.NFFT),
-	}
-
-	// Build the dense filterbank, then compress it into a sparse representation
-	denseBank := melFilterbank(cfg.NMels, cfg.NFFT, cfg.SampleRate)
-	e.melFilters = make([]melFilter, cfg.NMels)
-
-	for m, row := range denseBank {
-		start := -1
-		end := -1
-		for k, w := range row {
-			if w > 0 {
-				if start == -1 {
-					start = k
-				}
-				end = k
-			}
-		}
-		if start != -1 {
-			weights := make([]float32, end-start+1)
-			copy(weights, row[start:end+1])
-			e.melFilters[m] = melFilter{
-				startBin: start,
-				weights:  weights,
-			}
-		}
-	}
-
+	e := &Extractor{cfg: cfg}
+	e.window = hannWindow(cfg.WinLength)
+	e.melBank = melFilterbank(cfg.NMels, cfg.NFFT, cfg.SampleRate)
+	e.fftOrder = cfg.NFFT
 	return e
 }
 
+// NumFrames returns how many STFT frames `numSamples` of audio produce,
+// matching torch.stft's center=True framing (num_samples/hop + 1).
 func (e *Extractor) NumFrames(numSamples int) int {
 	if numSamples <= 0 {
 		return 0
@@ -83,124 +57,120 @@ func (e *Extractor) NumFrames(numSamples int) int {
 	return numSamples/e.cfg.HopLength + 1
 }
 
-// Compute returns log-mel features. Optimized to guarantee zero heap allocations
-// in the hot path beyond the required output matrix.
+// Compute returns log-mel features as [NMels][numFrames] (channel-major,
+// matching the ONNX `processed_signal` layout of [batch, n_mels, time]).
 func (e *Extractor) Compute(samples []float32) [][]float32 {
-	numSamples := len(samples)
-	numFrames := e.NumFrames(numSamples)
-	if numFrames == 0 {
-		return nil
-	}
+	pre := preemphasize(samples, e.cfg.Preemphasis)
+	padded := centerPad(pre, e.cfg.NFFT)
 
-	// 1. Single Contiguous Allocation for the 2D output
-	// Keeps cache locality perfect (matching ONNX expectations).
-	backing := make([]float32, e.cfg.NMels*numFrames)
+	numFrames := e.NumFrames(len(samples))
 	feats := make([][]float32, e.cfg.NMels)
-	for m := range e.cfg.NMels {
-		feats[m] = backing[m*numFrames : (m+1)*numFrames]
+	for m := range feats {
+		feats[m] = make([]float32, numFrames)
 	}
 
-	// 2. Local Scratch Buffers (No heap escape, highly efficient)
-	frame := make([]complex128, e.cfg.NFFT)
+	frame := make([]complex128, e.fftOrder)
 	powerSpec := make([]float64, e.cfg.NFFT/2+1)
 
-	padAmt := e.cfg.NFFT / 2
-	maxPaddedIdx := numSamples + e.cfg.NFFT
-	logGuard := float64(e.cfg.LogGuardValue)
-
-	// 3. Main processing loop
 	for f := range numFrames {
 		start := f * e.cfg.HopLength
-
-		// Fill complex frame using virtual padding & pre-emphasis (zero-copy)
-		for i := range e.cfg.NFFT {
+		for i := 0; i < e.fftOrder; i++ {
 			var s float32
-			paddedIdx := start + i
-			if i < e.cfg.WinLength && paddedIdx < maxPaddedIdx {
-				s = readPaddedPreemph(samples, paddedIdx, padAmt, e.cfg.Preemphasis)
-				s *= e.window[i]
+			idx := start + i
+			if i < e.cfg.WinLength && idx < len(padded) {
+				s = padded[idx] * e.window[i]
 			}
 			frame[i] = complex(float64(s), 0)
 		}
-
-		// In-place FFT
-		e.fftPlan.exec(frame)
-
-		// Compute power spectrum
+		fft(frame)
 		for k := range powerSpec {
 			re := real(frame[k])
 			im := imag(frame[k])
 			powerSpec[k] = re*re + im*im
 		}
-
-		// Apply Sparse Mel Filterbank
-		for m, filter := range e.melFilters {
+		for m := 0; m < e.cfg.NMels; m++ {
 			var sum float64
-			for i, w := range filter.weights {
-				sum += float64(w) * powerSpec[filter.startBin+i]
+			row := e.melBank[m]
+			for k, w := range row {
+				if w != 0 {
+					sum += float64(w) * powerSpec[k]
+				}
 			}
-			feats[m][f] = float32(math.Log(sum + logGuard))
+			feats[m][f] = float32(math.Log(sum + float64(e.cfg.LogGuardValue)))
 		}
 	}
-
 	return feats
 }
 
-// readPaddedPreemph virtually maps a padded array index back to the original audio,
-// computing PyTorch-style reflect padding and pre-emphasis completely on-the-fly.
-func readPaddedPreemph(samples []float32, paddedIdx, padAmt int, preemph float32) float32 {
-	n := len(samples)
-	if n == 0 {
-		return 0.0
+func preemphasize(x []float32, coef float32) []float32 {
+	if len(x) == 0 {
+		return x
 	}
-	if n == 1 {
-		return samples[0] // Pre-emph on 1 sample is just x[0]
+	out := make([]float32, len(x))
+	out[0] = x[0]
+	for i := 1; i < len(x); i++ {
+		out[i] = x[i] - coef*x[i-1]
 	}
-
-	origIdx := paddedIdx - padAmt
-
-	// PyTorch pad_mode='reflect' exact logic
-	if origIdx < 0 {
-		origIdx = -origIdx
-	} else if origIdx >= n {
-		overshoot := origIdx - (n - 1)
-		origIdx = (n - 1) - overshoot
-	}
-
-	// Foolproof bounded clamp to prevent panics on extremely tiny edge signals
-	origIdx = max(0, min(origIdx, n-1))
-
-	val := samples[origIdx]
-	if preemph != 0.0 && origIdx > 0 {
-		val -= preemph * samples[origIdx-1]
-	}
-	return val
+	return out
 }
 
+// centerPad reflects nFFT/2 samples onto each end, matching torch.stft's
+// default center=True, pad_mode="reflect".
+func centerPad(x []float32, nFFT int) []float32 {
+	padAmt := nFFT / 2
+	out := make([]float32, 0, len(x)+2*padAmt)
+	for i := padAmt; i >= 1; i-- {
+		idx := i
+		if idx >= len(x) {
+			idx = len(x) - 1
+		}
+		if idx < 0 {
+			idx = 0
+		}
+		out = append(out, x[idx])
+	}
+	out = append(out, x...)
+	for i := range padAmt {
+		idx := max(len(x)-2-i, 0)
+		out = append(out, x[idx])
+	}
+	return out
+}
+
+// hannWindow returns a periodic Hann window (matching torch.stft's default
+// window convention: 0.5 - 0.5*cos(2*pi*n/N), using N rather than N-1 in the
+// denominator).
 func hannWindow(n int) []float32 {
 	w := make([]float32, n)
-	factor := 2.0 * math.Pi / float64(n)
-	for i := range n {
-		w[i] = float32(0.5 - 0.5*math.Cos(float64(i)*factor))
+	for i := 0; i < n; i++ {
+		w[i] = float32(0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(n)))
 	}
 	return w
 }
 
+// melFilterbank builds a triangular mel filterbank matching librosa's
+// defaults (which is what NeMo's FilterbankFeatures calls under the hood):
+// the Slaney mel scale (htk=False) with Slaney-style area normalization
+// (norm='slaney'), and ramps computed by linear interpolation directly in
+// Hz-space against FFT bin center frequencies (not snapped to integer bins).
 func melFilterbank(nMels, nFFT, sampleRate int) [][]float32 {
 	nBins := nFFT/2 + 1
 	fMin, fMax := 0.0, float64(sampleRate)/2.0
 
+	// FFT bin center frequencies: linspace(0, sr/2, nBins).
 	fftFreqs := make([]float64, nBins)
 	for k := range nBins {
 		fftFreqs[k] = float64(k) * fMax / float64(nBins-1)
 	}
 
+	// nMels+2 mel-spaced points, converted to Hz via the Slaney mel scale.
 	melMin := hzToMelSlaney(fMin)
 	melMax := hzToMelSlaney(fMax)
+	melPoints := make([]float64, nMels+2)
 	hzPoints := make([]float64, nMels+2)
-	for i := range nMels + 2 {
-		mel := melMin + (melMax-melMin)*float64(i)/float64(nMels+1)
-		hzPoints[i] = melToHzSlaney(mel)
+	for i := range melPoints {
+		melPoints[i] = melMin + (melMax-melMin)*float64(i)/float64(nMels+1)
+		hzPoints[i] = melToHzSlaney(melPoints[i])
 	}
 
 	fdiff := make([]float64, nMels+1)
@@ -214,8 +184,14 @@ func melFilterbank(nMels, nFFT, sampleRate int) [][]float32 {
 		for k := range nBins {
 			lower := (fftFreqs[k] - hzPoints[m]) / fdiff[m]
 			upper := (hzPoints[m+2] - fftFreqs[k]) / fdiff[m+1]
-			row[k] = float32(max(0.0, math.Min(lower, upper)))
+			w := math.Min(lower, upper)
+			if w < 0 {
+				w = 0
+			}
+			row[k] = float32(w)
 		}
+		// Slaney-style area normalization: scale each filter so its
+		// integral is constant regardless of band width.
 		enorm := 2.0 / (hzPoints[m+2] - hzPoints[m])
 		for k := range row {
 			row[k] = float32(float64(row[k]) * enorm)
@@ -225,10 +201,14 @@ func melFilterbank(nMels, nFFT, sampleRate int) [][]float32 {
 	return bank
 }
 
+// hzToMelSlaney / melToHzSlaney implement librosa's default (htk=False)
+// mel scale: linear below 1kHz, logarithmic above it.
 func hzToMelSlaney(hz float64) float64 {
-	const fMin = 0.0
-	const fSp = 200.0 / 3.0
-	const minLogHz = 1000.0
+	const (
+		fMin     = 0.0
+		fSp      = 200.0 / 3.0
+		minLogHz = 1000.0
+	)
 	minLogMel := (minLogHz - fMin) / fSp
 	logstep := math.Log(6.4) / 27.0
 	if hz < minLogHz {
@@ -238,9 +218,11 @@ func hzToMelSlaney(hz float64) float64 {
 }
 
 func melToHzSlaney(mel float64) float64 {
-	const fMin = 0.0
-	const fSp = 200.0 / 3.0
-	const minLogHz = 1000.0
+	const (
+		fMin     = 0.0
+		fSp      = 200.0 / 3.0
+		minLogHz = 1000.0
+	)
 	minLogMel := (minLogHz - fMin) / fSp
 	logstep := math.Log(6.4) / 27.0
 	if mel < minLogMel {
@@ -249,68 +231,34 @@ func melToHzSlaney(mel float64) float64 {
 	return minLogHz * math.Exp(logstep*(mel-minLogMel))
 }
 
-// fftPlan holds precomputed twiddle factors and bit-reversal indices
-// for an extremely fast, zero-allocation Radix-2 Cooley-Tukey FFT.
-type fftPlan struct {
-	n       int
-	bitRev  []int
-	twiddle []complex128
-}
-
-func newFFTPlan(n int) *fftPlan {
-	plan := &fftPlan{
-		n:       n,
-		bitRev:  make([]int, n),
-		twiddle: make([]complex128, n/2),
-	}
-
-	// Precompute bit reversal to avoid loops and branching during inference
-	for i := range n {
-		j := 0
-		tmp := i
-		bit := n >> 1
-		for bit > 0 {
-			if tmp&1 == 1 {
-				j |= bit
-			}
-			tmp >>= 1
-			bit >>= 1
-		}
-		plan.bitRev[i] = j
-	}
-
-	// Precompute twiddle factors (W_N^k)
-	for i := range n / 2 {
-		ang := -2.0 * math.Pi * float64(i) / float64(n)
-		plan.twiddle[i] = complex(math.Cos(ang), math.Sin(ang))
-	}
-
-	return plan
-}
-
-func (p *fftPlan) exec(x []complex128) {
-	n := p.n
+// fft performs an in-place iterative radix-2 Cooley-Tukey FFT. len(x) must
+// be a power of two (true for n_fft=512 here).
+func fft(x []complex128) {
+	n := len(x)
 	if n <= 1 {
 		return
 	}
-
-	for i := range n {
-		j := p.bitRev[i]
+	for i, j := 1, 0; i < n; i++ {
+		bit := n >> 1
+		for ; j&bit != 0; bit >>= 1 {
+			j ^= bit
+		}
+		j ^= bit
 		if i < j {
 			x[i], x[j] = x[j], x[i]
 		}
 	}
-
 	for length := 2; length <= n; length <<= 1 {
-		half := length >> 1
-		step := n / length
+		ang := -2 * math.Pi / float64(length)
+		wlen := complex(math.Cos(ang), math.Sin(ang))
 		for i := 0; i < n; i += length {
-			for j := 0; j < half; j++ {
-				w := p.twiddle[j*step]
+			w := complex(1.0, 0.0)
+			for j := 0; j < length/2; j++ {
 				u := x[i+j]
-				v := x[i+j+half] * w
+				v := x[i+j+length/2] * w
 				x[i+j] = u + v
-				x[i+j+half] = u - v
+				x[i+j+length/2] = u - v
+				w *= wlen
 			}
 		}
 	}
